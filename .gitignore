@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 data/
 knowledge/
+documentation/MUSE_FIX_GUIDE.local.md

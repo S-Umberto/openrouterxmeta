@@ -5,7 +5,7 @@ Uso:
   python app.py --matches 2 --ticks 30 --llm
   python app.py --matches 1 --ticks 30 --no-llm   (solo euristica, veloce)
 """
-import argparse, json, math, os, random, sys
+import argparse, json, math, os, random, sys, time
 from pathlib import Path
 import urllib.request
 
@@ -37,6 +37,9 @@ class Player:
         self.x, self.y = 0.0, 0.0
         self.stats = {"goals":0,"shots":0,"passes":0,"tackles":0,"saves":0,"assists":0}
         self.total = {"goals":0,"shots":0,"passes":0,"tackles":0,"saves":0,"assists":0}
+        # evidenze per la memoria (tentativi + esiti, mai percentuali su zero tentativi)
+        self.ev = {"long_att":0,"long_scored":0,"close_att":0,"close_scored":0,
+                   "pass_att":0,"pass_ok":0,"last_dist":0}
         self.attrs = gen_attrs(role)
         self.knowledge = load_knowledge(pid, role)
     def speed(self):  # m/s ~ 3..9
@@ -78,6 +81,12 @@ def make_teams(seed=0):
     random.seed(seed)
     teams = [Team("Azzurri","#3eb7ff"), Team("Rossi","#ff5a5a")]
     roles = (["GK"]*3 + ["DEF"]*8 + ["MID"]*8 + ["FWD"]*6)
+    # memoria persistita per roster: se cambia il seed, i vecchi consigli non si riusano
+    seed_file = KNOW_DIR / "roster_seed.txt"
+    if not seed_file.exists() or seed_file.read_text(encoding="utf-8").strip() != str(seed):
+        for pid, role in enumerate(roles*2):
+            save_knowledge(pid, BASE_K[role])
+        seed_file.write_text(str(seed), encoding="utf-8")
     pid = 0
     for ti, t in enumerate(teams):
         for role in roles:
@@ -113,19 +122,60 @@ def load_knowledge(pid, role):
 def save_knowledge(pid, text):
     (KNOW_DIR / f"player_{pid:03d}.txt").write_text(text.strip(), encoding="utf-8")
 
+def add_tip(player, tip, source="evidence"):
+    """Memoria compatta: max 3 consigli attivi, etichettati per fonte."""
+    lines = [t.strip() for t in player.knowledge.splitlines() if t.strip()]
+    # rimuovi duplicati esatti, tieni gli ultimi 3
+    if tip not in lines:
+        lines.append(f"[{source}] {tip}")
+    player.knowledge = "\n".join(lines[-3:])
+    save_knowledge(player.id, player.knowledge)
+
 # ---------------- LLM (OpenRouter) ----------------
-def llm_call(system, user, max_tokens=4000):
-    if not API_KEY: return None
+# contatore API: la chiamata costa anche se il JSON non viene parsato
+API_STATS = {"calls":0,"succeeded":0,"failed":0,"cost_usd":0.0,"cost_partial":False,
+             "prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"latency_s":0.0}
+RUN_ID = 0
+PHASE = "idle"
+MODE = "fast"
+LAST_ERROR = ""
+LAST_STRATEGIES = {}
+LAST_SOURCES = {}
+CURRENT_RUN = [0]
+
+def record_llm(res):
+    API_STATS["calls"] += 1
+    API_STATS["latency_s"] += res.get("latency_s", 0.0)
+    usage = res.get("usage") or {}
+    for k in ("prompt_tokens","completion_tokens","total_tokens"):
+        if isinstance(usage.get(k), (int, float)):
+            API_STATS[k] += int(usage[k])
+    if usage.get("cost") is not None and isinstance(usage.get("cost"), (int, float)):
+        API_STATS["cost_usd"] += float(usage["cost"])
+    else:
+        API_STATS["cost_partial"] = True
+    if res.get("error"):
+        API_STATS["failed"] += 1
+    if res.get("parsed_ok"):
+        API_STATS["succeeded"] += 1
+
+def llm_call(system, user, max_tokens=4000, cancel=None):
+    """Ritorna dict {text, usage, id, latency_s, error, parsed_ok}."""
+    if not API_KEY:
+        return {"text":None,"error":"missing API key","latency_s":0.0}
     body = json.dumps({"model":MODEL,"messages":[{"role":"system","content":system},{"role":"user","content":user}],
                        "temperature":0.7,"max_tokens":max_tokens}).encode()
     req = urllib.request.Request(API_URL, data=body, headers={
         "Authorization": f"Bearer {API_KEY}", "Content-Type":"application/json"})
+    t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
-            return json.loads(r.read().decode())["choices"][0]["message"]["content"]
+            payload = json.loads(r.read().decode())
+        text = payload["choices"][0]["message"].get("content")
+        return {"text":text,"usage":payload.get("usage"),"id":payload.get("id"),
+                "latency_s":time.time()-t0,"error":"" if text else "empty content"}
     except Exception as e:
-        print(f"  [LLM] errore: {e}")
-        return None
+        return {"text":None,"error":f"{type(e).__name__}: {e}"[:200],"latency_s":time.time()-t0}
 
 def parse_json(text):
     if text is None: return None
@@ -135,26 +185,83 @@ def parse_json(text):
     except Exception:
         return None
 
-def llm_team_decide(team, opp, ball, tick, use_heu):
-    """Un manager LLM per team: muove tutti gli 11 titolari. Ritorna dict pid->decisione."""
-    xi = {p.id:i for i,p in enumerate(team.field())}
-    lines = []
+ALLOWED_ACTS = ("move","pass","shoot","dribble","tackle")
+
+def validate_moves(team, raw_moves, ball):
+    """Valida le mosse LLM: None se inutilizzabile, altrimenti moves complete per gli 11 titolari."""
+    if not isinstance(raw_moves, dict):
+        return None
+    own_ids = {p.id for p in team.field()}
+    heuristics = heuristic_decide(team, None, ball)
+    clean = {}
+    for k, v in raw_moves.items():
+        try:
+            pid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if pid not in own_ids or not isinstance(v, dict):
+            continue
+        try:
+            tx, ty = float(v.get("tx")), float(v.get("ty"))
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(tx) and math.isfinite(ty)):
+            continue
+        act = v.get("act", "move")
+        if act not in ALLOWED_ACTS:
+            continue
+        entry = {"tx":max(0.0,min(W,tx)), "ty":max(0.0,min(H,ty)), "act":act}
+        if act == "pass":
+            try:
+                tid = int(v.get("target_id"))
+            except (TypeError, ValueError):
+                tid = None
+            if tid is not None and tid in own_ids and tid != ball.get("owner"):
+                entry["target_id"] = tid
+        clean[pid] = entry
+    if not clean:
+        return None
+    merged = {}
+    for pid in sorted(own_ids):
+        merged[str(pid)] = clean.get(pid, heuristics[str(pid)])
+    return merged
+
+def llm_team_decide(team, opp, ball, tick, state):
+    """Un manager LLM per team: contesto completo, risposta validata. Ritorna (moves, strategy, source)."""
+    score = state.get("score", [0,0]) if isinstance(state, dict) else [0,0]
+    team_lines = []
     for p in team.field():
         a = p.attrs
-        lines.append(f"{p.id} {p.role} pos=({p.x:.0f},{p.y:.0f}) pace{a['pace']} tir{a['shooting']} pas{a['passing']} dri{a['dribbling']} tac{a['tackling']} | {p.knowledge[:120].replace(chr(10),' / ')}")
-    prompt = (f"Tick {tick}. Palla ({ball['x']:.0f},{ball['y']:.0f}) owner={ball['owner']}. "
-              f"Attacchi verso {'destra +x' if team.players[0].team==0 else 'sinistra -x'}. "
-              f"Punteggio A {teams[0].score if 'teams' in globals() else '?'} - R {teams[1].score if 'teams' in globals() else '?'}\n"
-              f"SQUADRA {team.name} (manager: dai la strategia, equilibrio attacco/difesa):\n" + "\n".join(lines) +
-              f"\nRispondi SOLO JSON: {{\"balance\":0-100,\"moves\":{{\"pid\":{{\"tx\":0-105,\"ty\":0-68,\"act\":\"move|pass|shoot|dribble|tackle\"}}}}}}")
-    sysp = ("Sei il manager di calcio. Muovi ogni titolare verso (tx,ty) compatibile con ruolo e "
-            "abilità (gli attaccanti tirano forte e con precisione, i difensori placcano). "
-            "Se un tuo giocatore ha la palla (owner=pid) usa pass/shoot/dribble.")
-    raw = llm_call(sysp, prompt, max_tokens=6000)
-    d = parse_json(raw)
+        mem = p.knowledge.replace("\n", " / ")[:300]  # memoria compatta per intero
+        team_lines.append(f"{p.id} {p.role} pos=({p.x:.0f},{p.y:.0f}) tir{a['shooting']} pas{a['passing']} dri{a['dribbling']} tac{a['tackling']} vel{a['pace']} | {mem}")
+    opp_lines = [f"{p.id} {p.role} pos=({p.x:.0f},{p.y:.0f})" for p in opp.field()]
+    ex = '{"strategy":"one short tactical line","moves":{"pid":{"tx":50,"ty":34,"act":"move","target_id":0}}}'
+    prompt = (f"Tick {tick}. Field 105x68. Ball ({ball['x']:.0f},{ball['y']:.0f}) owner={ball['owner']}. "
+              f"Score {score[0]}-{score[1]}. You attack {'right (+x)' if team.players[0].team==0 else 'left (-x)'}.\n"
+              f"YOUR TEAM {team.name} (11 starters, id role pos tir pas dri tac vel | memory):\n" + "\n".join(team_lines) +
+              f"\nOPPONENTS (11):\n" + "\n".join(opp_lines) +
+              f"\nReply ONLY JSON exactly like: {ex} "
+              "One move for every starter ID above. act must be move|pass|shoot|dribble|tackle. Use target_id (teammate) only for pass.")
+    sysp = ("You are a football manager. Move each of your 11 starters to (tx,ty) compatible with role and abilities "
+            "(forwards shoot strongly and accurately, defenders tackle). If one of your players has the ball (owner=pid) "
+            "use pass with target_id (a teammate, not yourself), shoot or dribble.")
+    res = llm_call(sysp, prompt, max_tokens=6000)
+    d = parse_json(res.get("text"))
+    res["parsed_ok"] = d is not None and isinstance(d.get("moves"), dict)
+    record_llm(res)
+    if res.get("error"):
+        LAST_ERROR = res["error"][:120]
     if d and isinstance(d.get("moves"), dict):
-        return d["moves"], d.get("balance", 50)
-    return heuristic_decide(team, opp, ball), 50
+        merged = validate_moves(team, d["moves"], ball)
+        if merged is not None:
+            strategy = str(d.get("strategy", ""))[:140]
+            LAST_STRATEGIES[team.name] = strategy
+            LAST_SOURCES[team.name] = "Ember"
+            return merged, strategy, "Ember"
+    # fallback esplicito, mai spacciato per Ember
+    LAST_STRATEGIES[team.name] = "Fallback heuristic (Ember error or invalid JSON)"
+    LAST_SOURCES[team.name] = "Fallback"
+    return heuristic_decide(team, opp, ball), LAST_STRATEGIES[team.name], "Fallback"
 
 def heuristic_decide(team, opp, ball):
     """Fallback senza LLM: home + pressione/distanza + azione portatore."""
@@ -172,7 +279,12 @@ def heuristic_decide(team, opp, ball):
             act = "shoot" if d < 30 else ("dribble" if random.random()<0.6 else "pass")
         elif p.role != "GK" and math.hypot(ball["x"]-p.x, ball["y"]-p.y) < 9:
             act = "tackle"
-        moves[str(p.id)] = {"tx":max(0,min(W,tx)),"ty":max(0,min(H,ty)),"act":act}
+        entry = {"tx":max(0,min(W,tx)),"ty":max(0,min(H,ty)),"act":act}
+        if act == "pass":  # euristico: compagno vicino come target
+            mates = [q for q in fld if q.id != p.id]
+            nearest = min(mates, key=lambda q: math.hypot(q.x-p.x,q.y-p.y))
+            entry["target_id"] = nearest.id
+        moves[str(p.id)] = entry
     return moves
 
 # ---------------- fisica / risoluzione ----------------
@@ -183,128 +295,167 @@ def move_toward(p, tx, ty, dt=2.0):
     s = min(d, p.speed()*dt*(0.7+0.3*p.attrs["stamina"]/99))
     p.x += dx/d*s; p.y += dy/d*s
 
-def resolve(ball, allf, teams, log):
-    """Risolvi pass/shoot/dribble/tackle con probabilita' basata sulle abilita'."""
+def resolve(ball, allf, teams, log, moves=None, was_goal=None):
+    """Risolvi pass/shoot/dribble con probabilita' basata sulle abilita'. Ritorna True se gol."""
     owner = next((p for p in allf if p.id==ball["owner"]), None)
-    # portatore avanza
-    if owner is not None:
-        pass
     act = ball.get("next_act","move")
+    moves = moves or {}
+    def clamp_ball():
+        for p in allf:
+            p.x = max(0.0, min(W, p.x)); p.y = max(0.0, min(H, p.y))
+        ball["x"] = max(0.0, min(W, ball["x"])); ball["y"] = max(0.0, min(H, ball["y"]))
+        cur = next((p for p in allf if p.id==ball.get("owner")), None)
+        if cur is not None:
+            ball["x"], ball["y"] = cur.x, cur.y
     if owner is not None and act == "shoot":
         gx = W if owner.team==0 else 0
         dist = math.hypot(gx-owner.x, 34-owner.y)
-        err = (99-owner.attrs["shooting"])/99*18 + dist*0.12
-        ty = 34 + random.uniform(-err,err)
         owner.stats["shots"] += 1
-        log.append(f"  Tiro di {owner.name} da {dist:.0f}m")
-        if GOAL_Y0 <= ty <= GOAL_Y1:
+        owner.ev["last_dist"] = int(dist)
+        long_shot = dist >= 20
+        (owner.ev.__setitem__("long_att", owner.ev["long_att"]+1) if long_shot
+         else owner.ev.__setitem__("close_att", owner.ev["close_att"]+1))
+        p_on = max(0.05, min(0.9, owner.attrs["shooting"]/100*0.75 + max(0, 20-dist)/100*0.25))
+        on_target = random.random() < p_on
+        log.append(f"  Shot by {owner.name} from {dist:.0f}m (shooting {owner.attrs['shooting']}), on target: {'yes' if on_target else 'no'}")
+        if on_target:
             gk = teams[1-owner.team].field()[0]
-            save_p = (gk.attrs["reflexes"]/99)*0.5 + (gk.attrs["positioning"]/99)*0.3
-            if random.random() < save_p*0.6 and dist < 25:
+            difficulty = min(0.3 + dist/100, 0.65) + owner.attrs["shooting"]/99*0.2
+            save_p = max(0.05, min(0.75, (gk.attrs["reflexes"]/99)*0.45 + (gk.attrs["positioning"]/99)*0.3 - difficulty*0.3))
+            if random.random() < save_p:
                 gk.stats["saves"] += 1
-                log.append(f"  PARATA di {gk.name}! (riflessi {gk.attrs['reflexes']})")
-                ball["owner"] = None; ball["x"], ball["y"] = gk.x, gk.y
+                log.append(f"  SAVE by {gk.name}! (reflexes {gk.attrs['reflexes']}, save chance {save_p:.2f})")
+                ball["owner"] = gk.id; ball["x"], ball["y"] = gk.x, gk.y
             else:
                 teams[owner.team].score += 1
                 owner.stats["goals"] += 1
-                # knowledge aggiornata LIVE durante il match in base a abilita' + risultato
-                if owner.attrs["shooting"] >= 70:
-                    live = f"Tira spesso da fuori area: il tuo tiro e' {owner.attrs['shooting']}, hai segnato {owner.stats['goals']} goal."
-                else:
-                    live = f"Colpiscila vicino alla porta: il tuo tiro e' {owner.attrs['shooting']}, cerca spazi stretti."
-                owner.knowledge = owner.knowledge + "\n" + live
-                save_knowledge(owner.id, owner.knowledge)
-                log.append(f"  GOOOL di {owner.name} ({teams[owner.team].name} {teams[0].score}-{teams[1].score} {teams[1].name})!")
-                kickoff(ball, teams)
+                (owner.ev.__setitem__("long_scored", owner.ev["long_scored"]+1) if long_shot
+                 else owner.ev.__setitem__("close_scored", owner.ev["close_scored"]+1))
+                # evidenza live immediata (non un giudizio di strategia)
+                side = "from distance" if long_shot else "close to goal"
+                add_tip(owner, f"evidence: scored {side} from {dist:.0f}m (shots {owner.stats['shots']}, goals {owner.stats['goals']})", source="evidence")
+                log.append(f"  GOAL by {owner.name} ({teams[owner.team].name} {teams[0].score}-{teams[1].score} {teams[1].name})! Memory updated.")
+                kickoff(ball, teams, conceding_team=1-owner.team)
         else:
-            log.append(f"  Fuori (ty={ty:.0f}).")
+            log.append("  Off target.")
             ball["owner"] = None
         ball["next_act"]="move"
+        clamp_ball()
+        return True if ball.get("owner") is not None and ball["x"] == W/2 else False
     elif owner is not None and act == "pass":
-        mates = [p for p in allf if p.team==owner.team and p.id!=owner.id]
-        ok = random.random() < owner.attrs["passing"]/100*0.8+0.2
-        tgt = min(mates, key=lambda p: math.hypot(p.x-owner.x,p.y-owner.y))
-        if ok:
-            tgt.stats["passes"] += 1; owner.stats["passes"] += 1
-            ball["owner"], ball["x"], ball["y"] = tgt.id, tgt.x, tgt.y
-            log.append(f"  Passaggio {owner.name} -> {tgt.name}")
+        owner.ev["pass_att"] += 1
+        mates = {p.id:p for p in allf if p.team==owner.team and p.id!=owner.id}
+        mv = moves.get(str(owner.id), {})
+        try:
+            tid = int(mv.get("target_id"))
+        except (TypeError, ValueError):
+            tid = None
+        if tid in mates:
+            tgt = mates[tid]
         else:
-            # intercetto
+            tgt = min(mates.values(), key=lambda p: math.hypot(p.x-owner.x,p.y-owner.y))
+        d = math.hypot(tgt.x-owner.x, tgt.y-owner.y)
+        p_ok = max(0.1, min(0.95, owner.attrs["passing"]/100*0.8 + 0.2 - d*0.004))
+        if random.random() < p_ok:
+            owner.stats["passes"] += 1; owner.ev["pass_ok"] += 1
+            ball["owner"], ball["x"], ball["y"] = tgt.id, tgt.x, tgt.y
+            log.append(f"  Pass {owner.name} -> {tgt.name} ({d:.0f}m)")
+        else:
             opps = [p for p in allf if p.team!=owner.team]
-            tgt2 = min(opps, key=lambda p: math.hypot(p.x-owner.x,p.y-owner.y))
+            tgt2 = min(opps, key=lambda p: math.hypot(p.x-tgt.x,p.y-tgt.y))
             tgt2.stats["tackles"] += 1
             ball["owner"], ball["x"], ball["y"] = tgt2.id, tgt2.x, tgt2.y
-            log.append(f"  Intercetto! {owner.name} perde palla ({owner.attrs['passing']} passing).")
+            log.append(f"  Interception! {owner.name} loses the ball to {tgt2.name} (passing {owner.attrs['passing']}).")
         ball["next_act"]="move"
+        clamp_ball()
     elif owner is not None and act == "dribble":
         opp = min([p for p in allf if p.team!=owner.team], key=lambda p: math.hypot(p.x-owner.x,p.y-owner.y))
         d = math.hypot(opp.x-owner.x, opp.y-owner.y)
         if d < 6 and random.random() > owner.attrs["dribbling"]/99*0.7:
             opp.stats["tackles"] += 1
             ball["owner"], ball["x"], ball["y"] = opp.id, opp.x, opp.y
-            log.append(f"  Placcato! {opp.name} ruba a {owner.name}.")
+            log.append(f"  Tackled! {opp.name} steals from {owner.name}.")
         else:
-            gx = W if owner.team==0 else 0
             owner.x += (1 if owner.team==0 else -1)*3.0
-            log.append(f"  Dribbling di {owner.name}.")
+            log.append(f"  Dribble by {owner.name}.")
         ball["next_act"]="move"
-    # tackle di chi e' vicino alla palla
-    for p in allf:
-        if ball["owner"] is not None and p.id != ball["owner"] and p.team != (next((q.team for q in allf if q.id==ball["owner"]),None)):
+        clamp_ball()
+    # contrasto dichiarato: solo chi ha dichiarato "tackle" puo' placcare
+    cur = next((p for p in allf if p.id==ball.get("owner")), None)
+    if cur is not None:
+        cands = [p for p in allf if p.team!=cur.team and moves.get(str(p.id), {}).get("act")=="tackle"]
+        if cands:
+            p = min(cands, key=lambda q: math.hypot(q.x-cur.x,q.y-cur.y))
             if math.hypot(ball["x"]-p.x, ball["y"]-p.y) < 3.0 and random.random() < p.attrs["tackling"]/99*0.4:
-                ball["owner"] = p.id
-                log.append(f"  Tackle di {p.name}!")
-                break
+                ball["owner"] = p.id; p.stats["tackles"] += 1
+                log.append(f"  Tackle by {p.name}!")
+                clamp_ball()
+        else:
+            clamp_ball()
 
-def kickoff(ball, teams):
+def kickoff(ball, teams, conceding_team=None):
     ball["x"], ball["y"], ball["owner"] = W/2, H/2, None
     for t in teams:
         for i,p in enumerate(t.field()):
             p.x, p.y = home_pos(p, i)
-    # assegna palla a un centrocampista della squadra che ha subito?
-    mids = [p for t in teams for p in t.field() if p.role=="MID"]
-    if mids:
-        m = random.choice(mids); ball["owner"]=m.id; ball["x"],ball["y"]=m.x,m.y
+    # il possesso va alla squadra che ha subito (se noto), altrimenti al centro
+    if conceding_team in (0, 1):
+        mids = [p for p in teams[conceding_team].field() if p.role=="MID"]
+        if mids:
+            m = mids[0]; ball["owner"]=m.id; ball["x"],ball["y"]=m.x,m.y
+    else:
+        mids = [p for t in teams for p in t.field() if p.role=="MID"]
+        if mids:
+            m = mids[0]; ball["owner"]=m.id; ball["x"],ball["y"]=m.x,m.y
 
 # ---------------- evoluzione knowledge ----------------
-def evolve_knowledge(teams, use_llm):
+def evolve_knowledge(teams, use_llm, cancel=None):
+    # 1) evidenze euristiche (etichettate) per i titolari, max 3 consigli
     for team in teams:
-        for p in team.players:
-            s = p.stats; a = p.attrs
-            # fallback euristico (abilita' -> consiglio)
-            tips = []
-            if s["goals"]>=1 and a["shooting"]>=70: tips.append(f"Tira spesso da fuori area: il tuo tiro e' {a['shooting']}, hai segnato {s['goals']} goal.")
-            if s["shots"]>=3 and s["goals"]==0 and a["shooting"]<60: tips.append("Devi migliorare il tiro: porta palla piu' vicino alla porta prima di tirare.")
-            if s["tackles"]>=2 and a["tackling"]>=70: tips.append("Pressa forte: il tuo placcaggio funziona, vai sul portatore.")
-            if s["saves"]>=1: tips.append(f"Resta sulla linea: hai gia' {s['saves']} parate.")
-            if s["passes"]>=4 and a["passing"]>=70: tips.append("Dai appoggio in costruzione: il tuo passaggio e' preciso.")
-            if tips:
-                p.knowledge = p.knowledge + "\n" + "\n".join(tips)
-                save_knowledge(p.id, p.knowledge)
-            elif use_llm:
-                # LLM solo per chi non ha segnali: breve arricchimento
-                pass
+        for p in team.field():
+            s, a, e = p.stats, p.attrs, p.ev
+            if e["long_att"] >= 2 and e["long_scored"] == 0 and a["shooting"] < 55:
+                add_tip(p, "evidence: 0 long-range goals from {n} attempts, close the distance first".format(n=e["long_att"]), source="heuristic")
+            if s["tackles"] >= 2 and a["tackling"] >= 70:
+                add_tip(p, "evidence: {n} tackles this match, press the carrier".format(n=s["tackles"]), source="heuristic")
+            if s["saves"] >= 1:
+                add_tip(p, "evidence: {n} saves this match, stay on goal line".format(n=s["saves"]), source="heuristic")
+            if e["pass_att"] >= 3 and e["pass_ok"] >= 3 and a["passing"] >= 70:
+                add_tip(p, "evidence: {a}/{b} passes completed, support in build-up".format(a=e["pass_ok"], b=e["pass_att"]), source="heuristic")
+    # 2) riflessione Ember: una chiamata per squadra, max 3 consigli brevi per titolare
     if use_llm:
-        # un LLM batch per team per ristrutturare le knowledge
         for team in teams:
+            if cancel and cancel.is_set(): break
             chunks = []
-            for p in team.players:
-                chunks.append(f"{p.id} {p.role} tir{a_str(p)} stats={p.stats} know:{p.knowledge[:200]}")
-            raw = llm_call("Sei un allenatore. Riscrivi la knowledge di ogni giocatore in 2-4 righe, collegando consigli e abilita'/stats reali.",
-                           f"Squadra {team.name}:\n" + "\n".join(chunks) +
-                           "\nRispondi SOLO JSON: {\"k\":{\"pid\":\"testo knowledge\"}}", max_tokens=8000)
-            d = parse_json(raw)
+            for p in team.field():
+                chunks.append(f"{p.id} {p.role} tir{p.attrs['shooting']} pas{p.attrs['passing']} tac{p.attrs['tackling']} stats={p.stats} ev={p.ev} memory:{p.knowledge[:300]}")
+            res = llm_call("You are a coach. Give each starter at most 3 short tips linked to their evidence. One match does not prove an optimal strategy. Bench players are excluded.",
+                           f"Team {team.name}:\n" + "\n".join(chunks) +
+                           "\nReply ONLY JSON: {\"k\":{\"pid\":\"tip1\\ntip2\"}}", max_tokens=8000, cancel=cancel)
+            d = parse_json(res.get("text"))
+            res["parsed_ok"] = d is not None and isinstance(d.get("k"), dict)
+            record_llm(res)
+            if res.get("error"):
+                LAST_ERROR = res["error"][:120]
             if d and isinstance(d.get("k"), dict):
-                pm = {p.id:p for p in team.players}
-                for k,v in d["k"].items():
-                    try: pm[int(k)].knowledge = str(v)[:600]; save_knowledge(int(k), str(v)[:600])
-                    except Exception: pass
+                pm = {p.id:p for p in team.field()}  # riserve: memoria precedente conservata
+                for k, v in d["k"].items():
+                    try:
+                        pid = int(k)
+                    except (TypeError, ValueError):
+                        continue
+                    if pid not in pm:
+                        continue
+                    tips = [t.strip() for t in str(v).splitlines() if t.strip()][:3]
+                    if tips:
+                        pm[pid].knowledge = "\n".join("[" + "Ember" + "] " + t for t in tips)
+                        save_knowledge(pid, pm[pid].knowledge)
 
 def a_str(p): return f"tir{p.attrs['shooting']} pas{p.attrs['passing']} pace{p.attrs['pace']}"
 
 # ---------------- match ----------------
 def snapshot(teams, ball, tick, events, mnum, think=False):
-    """Stato per la UI: posizioni + punteggio + knowledge titolari."""
+    """Stato per la UI: posizioni + punteggio + knowledge titolari. Scrittura atomica."""
     players = []
     for t in teams:
         for p in t.field():
@@ -313,14 +464,19 @@ def snapshot(teams, ball, tick, events, mnum, think=False):
                             "know":p.knowledge[:500],
                             "attrs":{"tir":p.attrs["shooting"],"pas":p.attrs["passing"],"vel":p.attrs["pace"]}})
     scorers = sorted([p for t in teams for p in t.players], key=lambda p:-p.total["goals"])[:5]
-    STATE_PATH.write_text(json.dumps({
-        "tick":tick,"mnum":mnum,"think":think,"score":[teams[0].score, teams[1].score],
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({
+        "tick":tick,"mnum":mnum,"think":think,"run_id":CURRENT_RUN[0],"phase":PHASE,"mode":MODE,
+        "last_error":LAST_ERROR,"strategies":dict(LAST_STRATEGIES),"sources":dict(LAST_SOURCES),
+        "api":dict(API_STATS),
+        "score":[teams[0].score, teams[1].score],
         "teams":[teams[0].name, teams[1].name],"ball":{"x":round(ball["x"],1),"y":round(ball["y"],1),"owner":ball.get("owner")},
         "players":players,"events":events[-14:],
         "scorers":[{"name":p.name,"role":p.role,"goals":p.total["goals"]} for p in scorers],
     }, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
 
-def play_match(teams, ticks, use_llm, mnum):
+def play_match(teams, ticks, use_llm, mnum, cancel=None, delay=0.0):
     for t in teams: t.score = 0
     ball = {"x":W/2, "y":H/2, "owner":None, "next_act":"move"}
     for t in teams:
@@ -332,11 +488,18 @@ def play_match(teams, ticks, use_llm, mnum):
     log = [f"=== Match {mnum}: {teams[0].name} vs {teams[1].name} (LLM={'sì' if use_llm else 'no'}, tick={ticks}) ==="]
     allf = teams[0].field() + teams[1].field()
     for tick in range(1, ticks+1):
-        snapshot(teams, ball, tick, log, mnum, think=(use_llm and tick % 3 == 0))
-        if use_llm and tick % 3 == 0:  # LLM ogni 3 tick, euristica negli altri: piu' veloce ed economico
-            m0,_ = llm_team_decide(teams[0], teams[1], ball, tick, True)
-            m1,_ = llm_team_decide(teams[1], teams[0], ball, tick, True)
+        if cancel and cancel.is_set():
+            log.append(f"Stopped at tick {tick}")
+            break
+        thinking = use_llm and (tick == 1 or tick % 3 == 0)  # prima decisione live al tick 1
+        snapshot(teams, ball, tick, log, mnum, think=thinking)
+        state = {"score":[teams[0].score, teams[1].score]}
+        if thinking:  # due manager sullo stesso snapshot, prima di muovere chiunque
+            m0,_,s0 = llm_team_decide(teams[0], teams[1], ball, tick, state)
+            m1,_,s1 = llm_team_decide(teams[1], teams[0], ball, tick, state)
             moves = {**m0, **m1}
+            log.append(f"  Manager {teams[0].name}: {s0}")
+            log.append(f"  Manager {teams[1].name}: {s1}")
         else:
             moves = {**heuristic_decide(teams[0], teams[1], ball), **heuristic_decide(teams[1], teams[0], ball)}
         # palla libera (rimessa laterale / rinvio semplificati): il più vicino la raccoglie
@@ -347,21 +510,31 @@ def play_match(teams, ticks, use_llm, mnum):
             log.append(f"  Rimessa/riconquista: la raccoglie {nearest.name}")
         for p in allf:
             mv = moves.get(str(p.id), {})
-            move_toward(p, float(mv.get("tx", p.x)), float(mv.get("ty", p.y)))
-            if ball["owner"] == p.id:
-                ball["next_act"] = mv.get("act","move")
-                ball["x"], ball["y"] = p.x, p.y
-        # fuori campo laterale -> torna dentro (fallo laterale semplificato)
-        if ball["y"] < 0 or ball["y"] > H:
-            ball["y"] = max(0.0, min(float(H), ball["y"]))
-            log.append("  Fallo laterale (palla rimessa in campo).")
-        resolve(ball, allf, teams, log)
+            try:
+                tx, ty = float(mv.get("tx", p.x)), float(mv.get("ty", p.y))
+                if not (math.isfinite(tx) and math.isfinite(ty)):
+                    tx, ty = p.x, p.y
+            except (TypeError, ValueError):
+                tx, ty = p.x, p.y
+            move_toward(p, max(0.0, min(W, tx)), max(0.0, min(H, ty)))
+            p.x = max(0.0, min(W, p.x)); p.y = max(0.0, min(H, p.y))
+        # sincronizza la palla con il possessore (invariante di fine tick)
+        cur = next((p for p in allf if p.id==ball.get("owner")), None)
+        if cur is not None:
+            ball["next_act"] = moves.get(str(cur.id), {}).get("act","move")
+            ball["x"], ball["y"] = cur.x, cur.y
+            if ball["next_act"] not in ALLOWED_ACTS:
+                ball["next_act"] = "move"
+        resolve(ball, allf, teams, log, moves=moves)
         log.append(f"tick {tick}: palla ({ball['x']:.0f},{ball['y']:.0f}) owner={ball['owner']} | {teams[0].score}-{teams[1].score}")
         snapshot(teams, ball, tick, log, mnum, think=False)
+        if delay and not (cancel and cancel.is_set()):
+            time.sleep(delay)
     log.append(f"FINALE Match {mnum}: {teams[0].name} {teams[0].score} - {teams[1].score} {teams[1].name}")
     for t in teams:  # cumulativo tra match
         for p in t.players:
             for k in p.total: p.total[k] += p.stats.get(k, 0)
+    snapshot(teams, ball, ticks, log, mnum, think=False)
     return "\n".join(log)
 
 def main():

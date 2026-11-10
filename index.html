@@ -1,93 +1,178 @@
-<!doctype html><html lang="it"><head><meta charset="utf8">
+<!doctype html><html lang="en"><head><meta charset="utf8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ember Football — Simulatore Calcio con Muse</title>
+<title>Ember Football — Muse Ember Football Simulator</title>
 <style>
-body{margin:0;background:#0b1020;color:#e8ecff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+body{margin:0;background:#14161c;color:#e8ecff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:1180px;margin:0 auto;padding:18px}
 header{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
 h1{margin:0;font-size:22px}
-.badge{background:#1e2a4d;border:1px solid #31427a;padding:4px 10px;border-radius:999px;font-size:12px}
+.badge{background:#1e2330;border:1px solid #343c56;padding:4px 10px;border-radius:999px;font-size:12px}
 button{background:#3eb7ff;border:0;color:#061022;font-weight:700;padding:10px 14px;border-radius:10px;cursor:pointer;margin-right:8px}
-button.ghost{background:#1e2a4d;color:#dce4ff;border:1px solid #31427a}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.ghost{background:#1e2330;color:#dce4ff;border:1px solid #343c56}
+.topbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .grid{display:grid;grid-template-columns:1.7fr 1fr;gap:16px;margin-top:14px}
 @media(max-width:900px){.grid{grid-template-columns:1fr}}
-.card{background:#121a33;border:1px solid #23305a;border-radius:16px;padding:14px}
-canvas{width:100%;background:#123f2a;border-radius:12px;display:block}
-#score{font-size:28px;font-weight:800}
-.feed{max-height:240px;overflow:auto;font-size:13px;line-height:1.5;white-space:pre-wrap}
-.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #31427a;margin-right:4px}
+.card{background:#1e2330;border:1px solid #343c56;border-radius:16px;padding:14px}
+canvas{width:100%;background:#0f3d22;border-radius:12px;display:block}
+#score{font-size:26px;font-weight:800}
+.feed{max-height:220px;overflow:auto;font-size:13px;line-height:1.5;white-space:pre-wrap}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #343c56;margin-right:4px}
 .think{color:#3eb7ff;font-weight:700}
-select,input{background:#0b1020;color:#e8ecff;border:1px solid #31427a;border-radius:8px;padding:8px}
-.small{font-size:13px;opacity:.85}
+select,input{background:#14161c;color:#e8ecff;border:1px solid #343c56;border-radius:8px;padding:8px}
+.small{font-size:13px;opacity:.9}
 ol{margin:8px 0;padding-left:22px}
+#goalBadge{font-weight:800;color:#ffd166;font-size:22px}
+details{margin-top:8px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+.kpi{background:#14161c;border:1px solid #343c56;border-radius:10px;padding:8px 10px;font-size:13px}
 </style></head><body><div class="wrap">
 <header>
-<div><h1>⚽ Ember Football Simulator</h1><div class="small">50 calciatori guidati in tempo reale da Muse Ember · due manager LLM · knowledge che evolve</div></div>
+<div><h1>⚽ Ember Football Simulator</h1><div class="small">50 footballers, two Muse Ember managers, memory that carries over to the next match. Hybrid system: Ember every 3 ticks, heuristic in between.</div></div>
 <span class="badge">meta/muse-ember via OpenRouter</span>
 </header>
-<div style="margin-top:12px">
-  <button id="bFast">▶ Demo veloce (euristica)</button>
-  <button id="bLLM">▶ Demo Live con Ember</button>
-  <button class="ghost" id="bStop">■ Stop</button>
+<div class="topbar">
+  <button id="bLLM">Run with Ember</button>
+  <button id="bFast">Practice without AI</button>
+  <button class="ghost" id="bNext">Next match</button>
+  <button class="ghost" id="bStop">Stop</button>
   <label class="small">Seed <input id="seed" type="number" value="1" style="width:70px"></label>
-  <label class="small">Match <input id="matches" type="number" value="2" style="width:60px"></label>
-  <label class="small">Tick <input id="ticks" type="number" value="15" style="width:60px"></label>
+  <label class="small">Matches <input id="matches" type="number" value="2" style="width:60px"></label>
+  <label class="small">Ticks <input id="ticks" type="number" value="15" style="width:60px"></label>
+  <span class="badge" id="modeBadge">HEURISTIC</span><span id="conn" class="small"></span>
 </div>
 <div class="grid">
 <section class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <div id="score">— 0 : 0 —</div><div class="small" id="stat">In attesa</div>
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+    <div id="score">— 0 : 0 — <span id="goalBadge"></span></div><div class="small" id="stat">Idle</div>
   </div>
+  <div class="kpis" id="kpis"></div>
   <canvas id="field" width="1050" height="680"></canvas>
   <div class="small" style="margin-top:8px">
     <span class="pill" style="color:#8ecbff">🔵 Azzurri</span><span class="pill" style="color:#ffb3b3">🔴 Rossi</span>
-    <span class="pill">Bianco = palla, ● = giocatore, ◎ = portatore</span>
+    <span class="pill">field 105×68 · goal y 28–40</span><span class="pill">white ring = carrier · thick ring = selected</span>
   </div>
-  <h3 style="margin:12px 0 6px">Cronaca live</h3><div class="feed" id="feed"></div>
+  <h3 style="margin:12px 0 6px">Commentary (significant events only)</h3><div class="feed" id="feed"></div>
 </section>
 <aside>
-<div class="card"><h3 style="margin-top:0">👨‍💼 Manager Ember</h3><div id="mgr" class="small">I due manager vedono la partita in real-time e scelgono movimenti + azione del portatore.</div>
-<h3>Capocannonieri</h3><ol id="top"></ol></div>
-<div class="card" style="margin-top:12px"><h3 style="margin-top:0">📚 Knowledge evolutiva</h3>
-<p class="small">Clicca un giocatore nel campo per vederla. Si aggiorna live al gol e dopo ogni match in base ad abilità + stats: chi tira bene impara a tirare da fuori area, chi pressa bene impara a pressare.</p>
-<pre id="know" class="small" style="white-space:pre-wrap;background:#0b1020;padding:10px;border-radius:10px">—</pre></div>
+<div class="card"><h3 style="margin-top:0">🧠 Manager strategies</h3>
+<p class="small">Azzurri score (if valid JSON): <span id="srcA" class="pill">—</span></p>
+<div class="small" id="stratA">—</div>
+<p class="small">Rossi score (if valid JSON): <span id="srcR" class="pill">—</span></p>
+<div class="small" id="stratR">—</div>
+<h3>Top scorers</h3><ol id="top"></ol></div>
+<div class="card" style="margin-top:12px"><h3 style="margin-top:0">📚 Player memory</h3>
+<p class="small">Click a player on the field. Tips carry over between matches for the same seed. Source labels show whether a tip came from match evidence, a heuristic, or Ember reflection.</p>
+<pre id="know" class="small" style="white-space:pre-wrap;background:#14161c;padding:10px;border-radius:10px">—</pre></div>
+<details class="card"><summary class="small">Advanced</summary>
+<p class="small">Hybrid engine: two Ember managers coordinate all 22 starters; heuristic ticks fill in between. Substitutes keep their previous memory. Costs below are measured from API usage.</p>
+<p class="small" id="api">—</p></details>
 </aside></div>
-<p class="small">File: <code>data/match_*.log</code> per la cronaca completa · <code>knowledge/player_*.txt</code> per le knowledge dei 50 giocatori.</p>
 </div>
 <script>
 const cv=document.getElementById('field'),ctx=cv.getContext('2d');
-let S=null;
-function draw(){
- ctx.fillStyle='#123f2a';ctx.fillRect(0,0,1050,680);
- ctx.strokeStyle='rgba(255,255,255,.75)';ctx.lineWidth=3;
- ctx.strokeRect(15,15,1020,650);ctx.beginPath();ctx.moveTo(525,15);ctx.lineTo(525,665);ctx.stroke();
- ctx.beginPath();ctx.arc(525,340,80,0,7);ctx.stroke();
- ctx.strokeRect(15,225,130,230);ctx.strokeRect(905,225,130,230);
- ctx.fillStyle='#fff';ctx.fillRect(15,315,8,50);ctx.fillRect(1027,315,8,50);
- if(!S){ctx.fillStyle='#fff';ctx.font='20px system-ui';ctx.fillText('Premi ▶ per iniziare',420,350);return;}
- const sx=10,sy=10;
- // palla
- const bx=S.ball.x*sx,by=S.ball.y*sy;
- ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(bx,by,9,0,7);ctx.fill();
- ctx.lineWidth=2;ctx.strokeStyle='#0b1020';ctx.stroke();
- for(const p of S.players){
-   const x=p.x*sx,y=p.y*sy;
-   ctx.fillStyle=p.team===0?'#3eb7ff':'#ff5a5a';
-   ctx.beginPath();ctx.arc(x,y,13,0,7);ctx.fill();
-   ctx.lineWidth=2;ctx.strokeStyle=p.has?'#fff':'rgba(0,0,0,.5)';ctx.stroke();
-   ctx.fillStyle='#061022';ctx.font='bold 11px system-ui';
-   ctx.fillText(p.role,x-10,y+4);
- }
- document.getElementById('score').textContent=S.teams[0]+' '+S.score[0]+' : '+S.score[1]+' '+S.teams[1];
- document.getElementById('stat').innerHTML='Match '+S.mnum+' · Tick '+S.tick+(S.think?' · <span class="think">Ember sta pensando…</span> <span class="pill">◎ portatore</span>':'');
- document.getElementById('feed').textContent=S.events.join('\n');
- document.getElementById('top').innerHTML=S.scorers.map(x=>`<li>${x.name} (${x.role}) — ${x.goals} gol</li>`).join('');
+let latest=null, prev=null, animStart=0, fails=0, selectedPlayerId=null, lastPhase="idle";
+function esc(s){return String(s)}
+function setButtons(running){
+  document.getElementById('bLLM').disabled=running;
+  document.getElementById('bFast').disabled=running;
+  document.getElementById('bNext').disabled=running;
+  document.getElementById('bStop').disabled=!running;
 }
-cv.onclick=e=>{if(!S)return;const r=cv.getBoundingClientRect();const x=(e.clientX-r.left)*1050/r.width,y=(e.clientY-r.top)*680/r.height;let best=null,bd=1e9;for(const p of S.players){const d=Math.hypot(p.x*10-x,p.y*10-y);if(d<bd){bd=d;best=p}}if(best)document.getElementById('know').textContent=`${best.name} (${best.role})\nTir ${best.attrs.tir} · Pas ${best.attrs.pas} · Vel ${best.attrs.vel}\n(pos ${best.x},${best.y})\n\n'+(best.know||'(knowledge non caricata — avvia un match)')}; 
-async function poll(){try{const r=await fetch('/state.json');S=await r.json();draw();}catch(e){}setTimeout(poll,300)} poll(); draw();
-async function start(mode){document.getElementById('stat').textContent=mode==='llm'?'Ember si sta collegando a OpenRouter…':'Avvio…';
- await fetch(`/start?mode=${mode}&seed=${document.getElementById('seed').value}&matches=${document.getElementById('matches').value}&ticks=${document.getElementById('ticks').value}`);}
-document.getElementById('bFast').onclick=()=>start('fast');
-document.getElementById('bLLM').onclick=()=>start('llm');
-document.getElementById('bStop').onclick=async()=>{await fetch('/stop');document.getElementById('stat').textContent='Fermato';};
+function draw(){
+  ctx.fillStyle='#0f3d22';ctx.fillRect(0,0,1050,680);
+  // discrete mowing stripes
+  ctx.fillStyle='rgba(255,255,255,.04)';
+  for(let i=0;i<6;i+=2) ctx.fillRect(i*175,0,175,680);
+  ctx.strokeStyle='rgba(255,255,255,.75)';ctx.lineWidth=3;
+  ctx.strokeRect(15,15,1020,650);ctx.beginPath();ctx.moveTo(525,15);ctx.lineTo(525,665);ctx.stroke();
+  ctx.beginPath();ctx.arc(525,340,80,0,7);ctx.stroke();
+  ctx.strokeRect(15,225,130,230);ctx.strokeRect(905,225,130,230);
+  ctx.fillStyle='#fff';ctx.fillRect(15,315,8,50);ctx.fillRect(1027,315,8,50);
+  if(!latest){ctx.fillStyle='#fff';ctx.font='20px system-ui';ctx.fillText('Press Run with Ember or Practice without AI',300,350);return;}
+  const k=10, running=(latest.phase==="running"||latest.phase==="thinking"||latest.phase==="reflecting");
+  setButtons(running);
+  // interpolate ~300ms between snapshots; snap on kickoff (big jump)
+  let t=1;
+  if(prev && latest && prev.tick===latest.tick-1 && running){
+    const el=performance.now()-animStart; t=Math.min(1, el/300);
+  }
+  const pos=id=>{const a=prev?prev.players.find(p=>p.id===id):null;const b=latest.players.find(p=>p.id===id);
+    if(!b) return null; if(!a) return b;
+    const jump=Math.hypot(b.x-a.x,b.y-a.y); if(jump>25) return b;
+    return {x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t};};
+  for(const p of latest.players){
+    const pp=pos(p.id); if(!pp) continue;
+    const x=pp.x*k,y=pp.y*k;
+    ctx.fillStyle=p.team===0?'#3eb7ff':'#ff5a5a';
+    ctx.beginPath();ctx.arc(x,y,13,0,7);ctx.fill();
+    ctx.lineWidth=2;ctx.strokeStyle=p.has?'#ffffff':'rgba(0,0,0,.5)';ctx.stroke();
+    if(p.id===selectedPlayerId){ctx.lineWidth=3;ctx.strokeStyle='#ffd166';ctx.beginPath();ctx.arc(x,y,18,0,7);ctx.stroke();}
+    ctx.fillStyle='#061022';ctx.font='bold 11px system-ui';ctx.fillText(p.role,x-10,y+4);
+  }
+  // ball AFTER players
+  const bpos=pos(null);
+  ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(latest.ball.x*k,latest.ball.y*k,9,0,7);ctx.fill();
+  ctx.lineWidth=2;ctx.strokeStyle='#0b1020';ctx.stroke();
+  document.getElementById('score').textContent=latest.teams[0]+' '+latest.score[0]+' : '+latest.score[1]+' '+latest.teams[1];
+  const goal=latest.events.find(e=>e.includes('GOAL'));
+  if(goal) document.getElementById('goalBadge').textContent='⚽ GOAL!';
+  else document.getElementById('goalBadge').textContent='';
+  const phaseText={idle:'Idle',running:'Running',thinking:'Thinking (waiting for API)…',reflecting:'Reflecting (updating memory)…',stopping:'Stopping…',finished:'Finished',error:'Error'};
+  document.getElementById('stat').textContent='Match '+latest.mnum+' · Tick '+latest.tick+' · '+ (phaseText[latest.phase]||latest.phase) + (latest.last_error?(' · '+latest.last_error):'');
+  document.getElementById('modeBadge').textContent=(latest.mode==='llm'?'EMBER':'HEURISTIC')+(Object.values(latest.sources||{}).some(s=>s==='Fallback')?' + FALLBACK':'');
+  const sig=latest.events.filter(e=>!/^tick /.test(e));
+  document.getElementById('feed').textContent=sig.slice(-14).join('\n')||'No significant events yet.';
+  document.getElementById('stratA').textContent=(latest.strategies||{})['Azzurri']||'—';
+  document.getElementById('stratR').textContent=(latest.strategies||{})['Rossi']||'—';
+  document.getElementById('srcA').textContent=(latest.sources||{})['Azzurri']||'—';
+  document.getElementById('srcR').textContent=(latest.sources||{})['Rossi']||'—';
+  document.getElementById('top').textContent='';
+  for(const s of latest.scorers||[]){const li=document.createElement('li');li.textContent=s.name+' ('+s.role+') — '+s.goals+' goals';document.getElementById('top').appendChild(li);}
+  const api=latest.api||{}; const partial=api.cost_partial?' (partial)':'';
+  document.getElementById('kpis').textContent='Measured API cost: $'+(api.cost_usd!=null?Number(api.cost_usd).toFixed(4):'0.0000')+partial+' · Calls: '+api.succeeded+'/'+api.calls+' ok · Tokens: '+(api.total_tokens||0)+' · Latency: '+Number(api.latency_s||0).toFixed(1)+'s';
+  document.getElementById('api').textContent='API: model meta/muse-ember · succeeded '+api.succeeded+' · failed '+api.failed+' · prompt '+(api.prompt_tokens||0)+' · completions '+(api.completion_tokens||0)+' · cost $'+Number(api.cost_usd||0).toFixed(4)+partial;
+  if(prev && prev.tick!==latest.tick){prev=latest;}
+  if(selectedPlayerId!=null){
+    const sel=latest.players.find(p=>p.id===selectedPlayerId);
+    if(sel) updatePanel(sel);
+  }
+}
+function updatePanel(p){
+  document.getElementById('know').textContent =
+    p.name+' ('+p.role+')\nShoot '+p.attrs.tir+' · Pass '+p.attrs.pas+' · Pace '+p.attrs.vel+'\nPosition ('+p.x+','+p.y+')\n\n'+`${p.know || 'No memory yet'}`;
+}
+function loop(){draw(); requestAnimationFrame(loop);}
+cv.addEventListener('click',e=>{
+  if(!latest) return;
+  const r=cv.getBoundingClientRect();
+  const x=(e.clientX-r.left)*1050/r.width, y=(e.clientY-r.top)*680/r.height;
+  let best=null,bd=1e9;
+  for(const p of latest.players){const d=Math.hypot(p.x*10-x,p.y*10-y); if(d<bd){bd=d;best=p;}}
+  if(bd>26){selectedPlayerId=null; document.getElementById('know').textContent='—'; return;}
+  selectedPlayerId=best.id; updatePanel(best);
+});
+async function poll(){
+  try{
+    const r=await fetch('/state.json');
+    if(!r.ok) throw new Error('bad status');
+    const s=await r.json();
+    if(!lastPhase||lastPhase!==s.phase){animStart=performance.now();}
+    lastPhase=s.phase; prev=latest; latest=s; fails=0;
+    document.getElementById('conn').textContent='';
+  }catch(e){
+    fails++; document.getElementById('conn').textContent = fails>3 ? 'Connection lost, retrying… ('+fails+')' : '';
+  }
+  setTimeout(poll,350);
+}
+async function start(mode){
+  document.getElementById('stat').textContent= mode==='llm'?'Connecting to OpenRouter…':'Starting…';
+  const r=await fetch('/start?mode='+mode+'&seed='+document.getElementById('seed').value+'&matches='+document.getElementById('matches').value+'&ticks='+document.getElementById('ticks').value);
+  if(!r.ok){const d=await r.json().catch(()=>({})); document.getElementById('stat').textContent='Error: '+(d.error||r.status);}
+}
+document.getElementById('bFast').addEventListener('click',()=>start('fast'));
+document.getElementById('bLLM').addEventListener('click',()=>start('llm'));
+document.getElementById('bNext').addEventListener('click',()=>start(document.getElementById('modeBadge').textContent.includes('EMBER')?'llm':'fast'));
+document.getElementById('bStop').addEventListener('click',async()=>{await fetch('/stop'); document.getElementById('stat').textContent='Stopping…';});
+poll(); loop();
 </script></body></html>

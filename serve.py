@@ -38,6 +38,16 @@ def run_loop(cancel, mode, seed, matches, ticks):
             app.PHASE = "finished" if not cancel.is_set() else "stopping"
     except Exception as e:
         app.PHASE = "error"; app.LAST_ERROR = f"{type(e).__name__}: {e}"[:160]
+    finally:
+        # pubblica sempre la fase terminale (finished/error/stopping) con errori e punteggio
+        try:
+            if teams is not None:
+                events = [f"Phase: {app.PHASE}"]
+                if app.LAST_ERROR:
+                    events.append(f"Error: {app.LAST_ERROR}")
+                app.snapshot(teams, {"x":52,"y":34,"owner":None}, 0, events, matches)
+        except Exception:
+            pass
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass

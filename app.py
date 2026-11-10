@@ -224,15 +224,16 @@ def validate_moves(team, raw_moves, ball):
     merged = {}
     for pid in sorted(own_ids):
         merged[str(pid)] = clean.get(pid, heuristics[str(pid)])
-    return merged
+    return merged, len(clean)
 
 def llm_team_decide(team, opp, ball, tick, state):
     """Un manager LLM per team: contesto completo, risposta validata. Ritorna (moves, strategy, source)."""
+    global LAST_ERROR
     score = state.get("score", [0,0]) if isinstance(state, dict) else [0,0]
     team_lines = []
     for p in team.field():
         a = p.attrs
-        mem = p.knowledge.replace("\n", " / ")[:300]  # memoria compatta per intero
+        mem = p.knowledge.replace("\n", " / ")  # max 3 consigli salvati, inviati per intero
         team_lines.append(f"{p.id} {p.role} pos=({p.x:.0f},{p.y:.0f}) tir{a['shooting']} pas{a['passing']} dri{a['dribbling']} tac{a['tackling']} vel{a['pace']} | {mem}")
     opp_lines = [f"{p.id} {p.role} pos=({p.x:.0f},{p.y:.0f})" for p in opp.field()]
     ex = '{"strategy":"one short tactical line","moves":{"pid":{"tx":50,"ty":34,"act":"move","target_id":0}}}'
@@ -252,12 +253,18 @@ def llm_team_decide(team, opp, ball, tick, state):
     if res.get("error"):
         LAST_ERROR = res["error"][:120]
     if d and isinstance(d.get("moves"), dict):
-        merged = validate_moves(team, d["moves"], ball)
-        if merged is not None:
+        validated = validate_moves(team, d["moves"], ball)
+        if validated is not None:
+            merged, n_valid = validated
             strategy = str(d.get("strategy", ""))[:140]
-            LAST_STRATEGIES[team.name] = strategy
-            LAST_SOURCES[team.name] = "Ember"
-            return merged, strategy, "Ember"
+            total = len(team.field())
+            if n_valid == total:
+                LAST_STRATEGIES[team.name] = strategy
+                LAST_SOURCES[team.name] = "Ember"
+                return merged, strategy, "Ember"
+            LAST_STRATEGIES[team.name] = "(partial Ember: " + str(n_valid) + "/" + str(total) + " valid, rest heuristic) " + strategy
+            LAST_SOURCES[team.name] = "Mixed"
+            return merged, LAST_STRATEGIES[team.name], "Mixed"
     # fallback esplicito, mai spacciato per Ember
     LAST_STRATEGIES[team.name] = "Fallback heuristic (Ember error or invalid JSON)"
     LAST_SOURCES[team.name] = "Fallback"
@@ -315,12 +322,13 @@ def resolve(ball, allf, teams, log, moves=None, was_goal=None):
         long_shot = dist >= 20
         (owner.ev.__setitem__("long_att", owner.ev["long_att"]+1) if long_shot
          else owner.ev.__setitem__("close_att", owner.ev["close_att"]+1))
-        p_on = max(0.05, min(0.9, owner.attrs["shooting"]/100*0.75 + max(0, 20-dist)/100*0.25))
+        # on target decresce con la distanza (anche oltre 20m); la parata dipende solo da portiere e tiro, non dalla distanza
+        p_on = max(0.05, min(0.9, owner.attrs["shooting"]/100*0.75 + max(0, 20-dist)/100*0.25 - max(0, dist-20)*0.004))
         on_target = random.random() < p_on
         log.append(f"  Shot by {owner.name} from {dist:.0f}m (shooting {owner.attrs['shooting']}), on target: {'yes' if on_target else 'no'}")
         if on_target:
             gk = teams[1-owner.team].field()[0]
-            difficulty = min(0.3 + dist/100, 0.65) + owner.attrs["shooting"]/99*0.2
+            difficulty = owner.attrs["shooting"]/99*0.3  # qualità del tiro, mai distanza
             save_p = max(0.05, min(0.75, (gk.attrs["reflexes"]/99)*0.45 + (gk.attrs["positioning"]/99)*0.3 - difficulty*0.3))
             if random.random() < save_p:
                 gk.stats["saves"] += 1
@@ -410,6 +418,7 @@ def kickoff(ball, teams, conceding_team=None):
 
 # ---------------- evoluzione knowledge ----------------
 def evolve_knowledge(teams, use_llm, cancel=None):
+    global LAST_ERROR
     # 1) evidenze euristiche (etichettate) per i titolari, max 3 consigli
     for team in teams:
         for p in team.field():
@@ -428,7 +437,7 @@ def evolve_knowledge(teams, use_llm, cancel=None):
             if cancel and cancel.is_set(): break
             chunks = []
             for p in team.field():
-                chunks.append(f"{p.id} {p.role} tir{p.attrs['shooting']} pas{p.attrs['passing']} tac{p.attrs['tackling']} stats={p.stats} ev={p.ev} memory:{p.knowledge[:300]}")
+                chunks.append(f"{p.id} {p.role} tir{p.attrs['shooting']} pas{p.attrs['passing']} tac{p.attrs['tackling']} stats={p.stats} ev={p.ev} memory:{p.knowledge}")
             res = llm_call("You are a coach. Give each starter at most 3 short tips linked to their evidence. One match does not prove an optimal strategy. Bench players are excluded.",
                            f"Team {team.name}:\n" + "\n".join(chunks) +
                            "\nReply ONLY JSON: {\"k\":{\"pid\":\"tip1\\ntip2\"}}", max_tokens=8000, cancel=cancel)
@@ -461,7 +470,7 @@ def snapshot(teams, ball, tick, events, mnum, think=False):
         for p in t.field():
             players.append({"id":p.id,"name":p.name,"team":p.team,"role":p.role,
                             "x":round(p.x,1),"y":round(p.y,1),"has":(ball.get("owner")==p.id),
-                            "know":p.knowledge[:500],
+                            "know":p.knowledge,
                             "attrs":{"tir":p.attrs["shooting"],"pas":p.attrs["passing"],"vel":p.attrs["pace"]}})
     scorers = sorted([p for t in teams for p in t.players], key=lambda p:-p.total["goals"])[:5]
     tmp = STATE_PATH.with_suffix(".json.tmp")

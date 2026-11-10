@@ -44,7 +44,7 @@ details{margin-top:8px}
 <div class="grid">
 <section class="card">
   <div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
-    <div id="score">— 0 : 0 — <span id="goalBadge"></span></div><div class="small" id="stat">Idle</div>
+    <div><span id="score">— 0 : 0 —</span> <span id="goalBadge"></span></div><div class="small" id="stat">Idle</div>
   </div>
   <div class="kpis" id="kpis"></div>
   <canvas id="field" width="1050" height="680"></canvas>
@@ -111,7 +111,6 @@ function draw(){
     ctx.fillStyle='#061022';ctx.font='bold 11px system-ui';ctx.fillText(p.role,x-10,y+4);
   }
   // ball AFTER players
-  const bpos=pos(null);
   ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(latest.ball.x*k,latest.ball.y*k,9,0,7);ctx.fill();
   ctx.lineWidth=2;ctx.strokeStyle='#0b1020';ctx.stroke();
   document.getElementById('score').textContent=latest.teams[0]+' '+latest.score[0]+' : '+latest.score[1]+' '+latest.teams[1];
@@ -132,7 +131,6 @@ function draw(){
   const api=latest.api||{}; const partial=api.cost_partial?' (partial)':'';
   document.getElementById('kpis').textContent='Measured API cost: $'+(api.cost_usd!=null?Number(api.cost_usd).toFixed(4):'0.0000')+partial+' · Calls: '+api.succeeded+'/'+api.calls+' ok · Tokens: '+(api.total_tokens||0)+' · Latency: '+Number(api.latency_s||0).toFixed(1)+'s';
   document.getElementById('api').textContent='API: model meta/muse-ember · succeeded '+api.succeeded+' · failed '+api.failed+' · prompt '+(api.prompt_tokens||0)+' · completions '+(api.completion_tokens||0)+' · cost $'+Number(api.cost_usd||0).toFixed(4)+partial;
-  if(prev && prev.tick!==latest.tick){prev=latest;}
   if(selectedPlayerId!=null){
     const sel=latest.players.find(p=>p.id===selectedPlayerId);
     if(sel) updatePanel(sel);
@@ -142,7 +140,7 @@ function updatePanel(p){
   document.getElementById('know').textContent =
     p.name+' ('+p.role+')\nShoot '+p.attrs.tir+' · Pass '+p.attrs.pas+' · Pace '+p.attrs.vel+'\nPosition ('+p.x+','+p.y+')\n\n'+`${p.know || 'No memory yet'}`;
 }
-function loop(){draw(); requestAnimationFrame(loop);}
+function loop(){try{draw();}catch(e){/* keep rendering even on a single frame error */} requestAnimationFrame(loop);}
 cv.addEventListener('click',e=>{
   if(!latest) return;
   const r=cv.getBoundingClientRect();
@@ -157,8 +155,10 @@ async function poll(){
     const r=await fetch('/state.json');
     if(!r.ok) throw new Error('bad status');
     const s=await r.json();
-    if(!lastPhase||lastPhase!==s.phase){animStart=performance.now();}
-    lastPhase=s.phase; prev=latest; latest=s; fails=0;
+    if(!latest || s.tick!==latest.tick || s.run_id!==latest.run_id){
+      prev=latest; animStart=performance.now();
+    }
+    lastPhase=s.phase; latest=s; fails=0;
     document.getElementById('conn').textContent='';
   }catch(e){
     fails++; document.getElementById('conn').textContent = fails>3 ? 'Connection lost, retrying… ('+fails+')' : '';

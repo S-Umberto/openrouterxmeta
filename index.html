@@ -1,0 +1,93 @@
+<!doctype html><html lang="it"><head><meta charset="utf8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ember Football — Simulatore Calcio con Muse</title>
+<style>
+body{margin:0;background:#0b1020;color:#e8ecff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:18px}
+header{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+h1{margin:0;font-size:22px}
+.badge{background:#1e2a4d;border:1px solid #31427a;padding:4px 10px;border-radius:999px;font-size:12px}
+button{background:#3eb7ff;border:0;color:#061022;font-weight:700;padding:10px 14px;border-radius:10px;cursor:pointer;margin-right:8px}
+button.ghost{background:#1e2a4d;color:#dce4ff;border:1px solid #31427a}
+.grid{display:grid;grid-template-columns:1.7fr 1fr;gap:16px;margin-top:14px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:#121a33;border:1px solid #23305a;border-radius:16px;padding:14px}
+canvas{width:100%;background:#123f2a;border-radius:12px;display:block}
+#score{font-size:28px;font-weight:800}
+.feed{max-height:240px;overflow:auto;font-size:13px;line-height:1.5;white-space:pre-wrap}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;border:1px solid #31427a;margin-right:4px}
+.think{color:#3eb7ff;font-weight:700}
+select,input{background:#0b1020;color:#e8ecff;border:1px solid #31427a;border-radius:8px;padding:8px}
+.small{font-size:13px;opacity:.85}
+ol{margin:8px 0;padding-left:22px}
+</style></head><body><div class="wrap">
+<header>
+<div><h1>⚽ Ember Football Simulator</h1><div class="small">50 calciatori guidati in tempo reale da Muse Ember · due manager LLM · knowledge che evolve</div></div>
+<span class="badge">meta/muse-ember via OpenRouter</span>
+</header>
+<div style="margin-top:12px">
+  <button id="bFast">▶ Demo veloce (euristica)</button>
+  <button id="bLLM">▶ Demo Live con Ember</button>
+  <button class="ghost" id="bStop">■ Stop</button>
+  <label class="small">Seed <input id="seed" type="number" value="1" style="width:70px"></label>
+  <label class="small">Match <input id="matches" type="number" value="2" style="width:60px"></label>
+  <label class="small">Tick <input id="ticks" type="number" value="15" style="width:60px"></label>
+</div>
+<div class="grid">
+<section class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <div id="score">— 0 : 0 —</div><div class="small" id="stat">In attesa</div>
+  </div>
+  <canvas id="field" width="1050" height="680"></canvas>
+  <div class="small" style="margin-top:8px">
+    <span class="pill" style="color:#8ecbff">🔵 Azzurri</span><span class="pill" style="color:#ffb3b3">🔴 Rossi</span>
+    <span class="pill">Bianco = palla, ● = giocatore, ◎ = portatore</span>
+  </div>
+  <h3 style="margin:12px 0 6px">Cronaca live</h3><div class="feed" id="feed"></div>
+</section>
+<aside>
+<div class="card"><h3 style="margin-top:0">👨‍💼 Manager Ember</h3><div id="mgr" class="small">I due manager vedono la partita in real-time e scelgono movimenti + azione del portatore.</div>
+<h3>Capocannonieri</h3><ol id="top"></ol></div>
+<div class="card" style="margin-top:12px"><h3 style="margin-top:0">📚 Knowledge evolutiva</h3>
+<p class="small">Clicca un giocatore nel campo per vederla. Si aggiorna live al gol e dopo ogni match in base ad abilità + stats: chi tira bene impara a tirare da fuori area, chi pressa bene impara a pressare.</p>
+<pre id="know" class="small" style="white-space:pre-wrap;background:#0b1020;padding:10px;border-radius:10px">—</pre></div>
+</aside></div>
+<p class="small">File: <code>data/match_*.log</code> per la cronaca completa · <code>knowledge/player_*.txt</code> per le knowledge dei 50 giocatori.</p>
+</div>
+<script>
+const cv=document.getElementById('field'),ctx=cv.getContext('2d');
+let S=null;
+function draw(){
+ ctx.fillStyle='#123f2a';ctx.fillRect(0,0,1050,680);
+ ctx.strokeStyle='rgba(255,255,255,.75)';ctx.lineWidth=3;
+ ctx.strokeRect(15,15,1020,650);ctx.beginPath();ctx.moveTo(525,15);ctx.lineTo(525,665);ctx.stroke();
+ ctx.beginPath();ctx.arc(525,340,80,0,7);ctx.stroke();
+ ctx.strokeRect(15,225,130,230);ctx.strokeRect(905,225,130,230);
+ ctx.fillStyle='#fff';ctx.fillRect(15,315,8,50);ctx.fillRect(1027,315,8,50);
+ if(!S){ctx.fillStyle='#fff';ctx.font='20px system-ui';ctx.fillText('Premi ▶ per iniziare',420,350);return;}
+ const sx=10,sy=10;
+ // palla
+ const bx=S.ball.x*sx,by=S.ball.y*sy;
+ ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(bx,by,9,0,7);ctx.fill();
+ ctx.lineWidth=2;ctx.strokeStyle='#0b1020';ctx.stroke();
+ for(const p of S.players){
+   const x=p.x*sx,y=p.y*sy;
+   ctx.fillStyle=p.team===0?'#3eb7ff':'#ff5a5a';
+   ctx.beginPath();ctx.arc(x,y,13,0,7);ctx.fill();
+   ctx.lineWidth=2;ctx.strokeStyle=p.has?'#fff':'rgba(0,0,0,.5)';ctx.stroke();
+   ctx.fillStyle='#061022';ctx.font='bold 11px system-ui';
+   ctx.fillText(p.role,x-10,y+4);
+ }
+ document.getElementById('score').textContent=S.teams[0]+' '+S.score[0]+' : '+S.score[1]+' '+S.teams[1];
+ document.getElementById('stat').innerHTML='Match '+S.mnum+' · Tick '+S.tick+(S.think?' · <span class="think">Ember sta pensando…</span> <span class="pill">◎ portatore</span>':'');
+ document.getElementById('feed').textContent=S.events.join('\n');
+ document.getElementById('top').innerHTML=S.scorers.map(x=>`<li>${x.name} (${x.role}) — ${x.goals} gol</li>`).join('');
+}
+cv.onclick=e=>{if(!S)return;const r=cv.getBoundingClientRect();const x=(e.clientX-r.left)*1050/r.width,y=(e.clientY-r.top)*680/r.height;let best=null,bd=1e9;for(const p of S.players){const d=Math.hypot(p.x*10-x,p.y*10-y);if(d<bd){bd=d;best=p}}if(best)document.getElementById('know').textContent=`${best.name} (${best.role})\nTir ${best.attrs.tir} · Pas ${best.attrs.pas} · Vel ${best.attrs.vel}\n(pos ${best.x},${best.y})\n\n'+(best.know||'(knowledge non caricata — avvia un match)')}; 
+async function poll(){try{const r=await fetch('/state.json');S=await r.json();draw();}catch(e){}setTimeout(poll,300)} poll(); draw();
+async function start(mode){document.getElementById('stat').textContent=mode==='llm'?'Ember si sta collegando a OpenRouter…':'Avvio…';
+ await fetch(`/start?mode=${mode}&seed=${document.getElementById('seed').value}&matches=${document.getElementById('matches').value}&ticks=${document.getElementById('ticks').value}`);}
+document.getElementById('bFast').onclick=()=>start('fast');
+document.getElementById('bLLM').onclick=()=>start('llm');
+document.getElementById('bStop').onclick=async()=>{await fetch('/stop');document.getElementById('stat').textContent='Fermato';};
+</script></body></html>

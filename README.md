@@ -1,56 +1,56 @@
 # ⚽ Ember Football Simulator
 
-**50 giocatori di calcio vivi, guidati in tempo reale da Muse Ember.**
+**50 living footballers guided in real time by Muse Ember.**
 
-Per il **$1 Challenge** (OpenRouter × Meta Build Day): un simulatore dove ogni azione sul campo esiste solo perché `meta/muse-ember` la decide, la motiva e poi la impara. Costo di una demo completa: centesimi.
+For the **$1 Challenge** (OpenRouter × Meta Build Day): a simulator where every on-pitch action exists because `meta/muse-ember` decides it, motivates it, and then learns from it. Cost of a full demo: pennies.
 
-## L'idea in 20 secondi
+## The idea in 20 seconds
 
-Generiamo 50 calciatori random (2 rose da 3P/8D/8C/6A) con tratti in stile FIFA — l'attaccante tira più forte e più preciso del difensore, il portiere para con i riflessi, ecc. Ogni giocatore nasce con una *knowledge* testuale ("quando sei in area tira", "cerca zone libere", "dai appoggio al portatore").
+We generate 50 random footballers (two squads of 3 GK / 8 DEF / 8 MID / 6 FWD) with FIFA-style traits — the forward shoots harder and more accurately than the defender, the goalkeeper saves with reflexes, and so on. Each player is born with a textual *knowledge* ("when you are inside the box, shoot", "separate into free zones", "support the ball carrier").
 
-Durante la partita **due manager Muse Ember** vedono la partita in real-time e decidono i movimenti di tutti gli 11 titolari + l'azione del portatore (passo / tiro / dribbling / placcaggio). L'esito è calcolato in Python dalle abilità, così la tecnica conta davvero. Al gol la knowledge del marcatore si aggiorna **subito** in base ad abilità + risultato (chi ha tiro 90+ impara a "tirare spesso da fuori area"), e dopo ogni match Ember riscrive le 50 knowledge collegando abilità e stats reali. Giochi più match → i giocatori e le squadre evolvono.
+During the match, **two Muse Ember managers** watch the game in real time and choose the movement of all 11 starters plus the ball carrier's action (pass / shoot / dribble / tackle). The outcome is computed in Python from the players' abilities, so technique really matters. On a goal, the scorer's knowledge is updated **immediately** from ability + result (a 90+ shooter learns to "shoot often from outside the box"), and after each match Ember rewrites all 50 knowledges linking abilities to real stats. Play more matches → players and teams evolve.
 
-## Perché è diverso
+## Why this is different
 
-- **LLM come cervello distribuito, non come chatbot.** Non parli con il modello: lo incarni in 50 corpi. Ogni tick è una decisione tattica reale, il resto è una chat.
-- **Apprendimento emergente.** Nessuna regola hard-coded dice "tira da fuori area": emerge dal loop abilità → risultato → knowledge.
-- **Interamente dimostrabile in 1 minuto.** UI live con campo, cronaca e knowledge cliccabile. Vedi l'evoluzione mentre giochi.
+- **The LLM as a distributed brain, not a chatbot.** You don't talk to the model: you embody it into 50 bodies. Every tick is a real tactical decision, not a chat.
+- **Emergent learning.** No hard-coded rule says "shoot from outside the box": it emerges from the ability → result → knowledge loop.
+- **Demonstrable in 1 minute.** Live UI with field, commentary, and clickable knowledge. You watch evolution while playing.
 
-## Demo (1 minuto, per il video)
+## Demo (1 minute, for the video)
 
 ```bash
-cp .env.example .env    # la tua OpenRouter key
+cp .env.example .env    # your OpenRouter key
 python3 serve.py        # http://localhost:8000
 ```
 
-1. Premi **Demo veloce** (euristica) → partono 2 match live: gol, parate, cronaca.
-2. Clicca un marcatore → vedi la knowledge che ha imparato dal gol.
-3. Premi **Demo Live con Ember** → compare "Ember sta pensando…", il manager LLM guida il match.
+1. Press **Fast demo** (heuristic) → two live matches start: goals, saves, commentary.
+2. Click a scorer → see the knowledge he learned from the goal.
+3. Press **Live demo with Ember** → "Ember is thinking…" appears, the LLM manager drives the match.
 
-## Come è fatto
+## How it is built
 
-| Parte | File |
+| Part | File |
 |---|---|
-| Motore + tratti FIFA-style + fisica probabilistica | `app.py` |
-| UI live (campo animato, cronaca, knowledge) | `index.html` |
-| Server demo (solo stdlib) | `serve.py` |
-| Log match | `data/match_*.log` (git-ignorati) |
-| Knowledge 50 giocatori | `knowledge/player_*.txt` (git-ignorati) |
+| Engine + FIFA-style traits + probabilistic physics | `app.py` |
+| Live UI (animated field, commentary, knowledge) | `index.html` |
+| Demo server (stdlib only) | `serve.py` |
+| Match logs | `data/match_*.log` (git-ignored) |
+| Knowledge of 50 players | `knowledge/player_*.txt` (git-ignored) |
 
-**Uso dell'LLM (requisito showcase):** ogni decisione tattica passa da `POST https://openrouter.ai/api/v1/chat/completions` con modello `meta/muse-ember`. Il manager riceve stato campo + abilità + knowledge + punteggio e risponde solo JSON con le destinazioni di tutti i titolari. Strategia economica: LLM ogni 3 tick, euristica nei tick intermedi → ~1/3 delle chiamate, stesso spettacolo.
+**LLM usage (showcase requirement):** every tactical decision goes through `POST https://openrouter.ai/api/v1/chat/completions` with model `meta/muse-ember`. The manager receives field state + abilities + knowledge + score and replies with JSON-only destinations for all starters. Cost-saving strategy: LLM every 3 ticks, heuristic in between → ~1/3 of the calls, same show.
 
-**CLI (per iterare senza UI):**
+**CLI (for iteration without UI):**
 ```bash
-python3 app.py --matches 2 --ticks 20 --seed 1 --no-llm   # veloce
-python3 app.py --matches 2 --ticks 20 --seed 1 --llm      # guidata da Ember
+python3 app.py --matches 2 --ticks 20 --seed 1 --no-llm   # fast
+python3 app.py --matches 2 --ticks 20 --seed 1 --llm      # guided by Ember
 ```
 
-## Note per la giuria
+## Notes for the judges
 
-- **≤$1:** simulazioni a pochi tick costano pochi centesimi; il progetto gira anche senza LLM grazie all'euristica di fallback.
-- **Limiti onesti:** calcio semplificato (niente falli, fuori gioco o panchina persistente; 11 titolari scelti per ruolo); risoluzione tiri/passaggi probabilistica; `meta/muse-ember` usa molto reasoning, servono `max_tokens ≥ 4000` (già gestito).
-- **Team/credits:** modello `meta/muse-ember` via OpenRouter; OpenRouter user ID e demo video da aggiungere alla submission su Cerebral Valley.
+- **≤$1:** simulations at a few ticks cost pennies; the project also runs without the LLM thanks to the heuristic fallback.
+- **Honest limits:** simplified football (no fouls, offside, or persistent bench; 11 starters picked by role); probabilistic shot/pass resolution; `meta/muse-ember` consumes a lot of reasoning tokens, so `max_tokens ≥ 4000` is required (already handled).
+- **Team/credits:** model `meta/muse-ember` via OpenRouter; OpenRouter user ID and demo video to be added to the Cerebral Valley submission.
 
-## Licenza / hackathon
+## License / hackathon
 
-Build Day: libero per dimostrazione e riuso didattico. Non includere mai `.env` nei commit (già in `.gitignore`).
+Build Day: free for demonstration and educational reuse. Never include `.env` in commits (already in `.gitignore`).
